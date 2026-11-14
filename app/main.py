@@ -12,6 +12,11 @@ from .config import Settings
 from .db import DatabaseBusy, initialize
 from .models import (
     ConflictResponse,
+    CorrectionConfirmRequest,
+    CorrectionConfirmResponse,
+    CorrectionErrorResponse,
+    CorrectionProposalResponse,
+    CorrectionProposeRequest,
     ErrorResponse,
     HealthResponse,
     IngestRequest,
@@ -21,7 +26,16 @@ from .models import (
     UndoRequest,
 )
 from .seed import seed_demo_data
-from .service import BatchRejected, ingest, list_meters, query_meter, undo
+from .service import (
+    BatchRejected,
+    CorrectionRejected,
+    correction_confirm,
+    correction_propose,
+    ingest,
+    list_meters,
+    query_meter,
+    undo,
+)
 
 _BUSY_MESSAGE = "database is locked"
 
@@ -49,6 +63,8 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
             "把网关补传的累计读数转换成区间用电量。\n\n"
             "* **入仓** `POST /api/v1/readings`：整批原子提交，乱序补传按电表号+时刻排序后求差。\n"
             "* **撤销** `POST /api/v1/readings/undo`：按源记录号撤销，并重算受影响区间。\n"
+            "* **纠错提案** `POST /api/v1/corrections/propose`：在两个可信记录号之间求最少撤销方案。\n"
+            "* **纠错确认** `POST /api/v1/corrections/confirm`：单事务核对快照序号与方案后撤销并重算。\n"
             "* **查询** `GET /api/v1/meters/{meter_id}`：单次一致性快照，返回读数、区间、断点。\n\n"
             "同一源记录号重复提交相同内容为幂等重试；同号异内容、同表同刻冲突会整批拒绝（409）。"
         ),
@@ -93,6 +109,15 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
                 message=exc.message,
                 conflicts=exc.conflicts,
             ).model_dump(),
+        )
+
+    @app.exception_handler(CorrectionRejected)
+    async def _correction_handler(
+        request: Request, exc: CorrectionRejected
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=exc.as_response().model_dump(),
         )
 
     def settings_of(request: Request) -> Settings:
@@ -149,6 +174,69 @@ def create_app(settings: Settings | None = None, seed_demo: bool = False) -> Fas
         返回 `not_found`，不算失败。
         """
         return undo(settings_of(request), payload.source_record_ids)
+
+    @app.post(
+        "/api/v1/corrections/propose",
+        response_model=CorrectionProposalResponse,
+        responses={
+            404: {"model": CorrectionErrorResponse, "description": "端点记录不存在"},
+            422: {"model": CorrectionErrorResponse, "description": "端点不属于同一电表或时序非法"},
+            503: {"model": ErrorResponse},
+        },
+        tags=["纠错"],
+    )
+    def propose_correction(
+        payload: CorrectionProposeRequest, request: Request
+    ) -> CorrectionProposalResponse:
+        """纠错提案：求两个可信源记录号之间的最少撤销方案。
+
+        * 区间按换表标记切段；两个端点与所有换表读数必须保留，换表读数开启新段。
+        * 每段在必留点约束下求最长非降子序列，撤销数最少即保留数最多。
+        * 必留读数之间存在递减（如换表标记处的可信回退被固定）时返回
+          `status=no_solution` 并说明原因。
+        * 存在多个并列最少撤销集合时返回 `status=not_unique`，不自动选择。
+        * 仅当方案唯一时返回待撤销源记录号与提案快照的 `commit_seq`，
+          供 `POST /api/v1/corrections/confirm` 确认。
+        """
+        return correction_propose(
+            settings_of(request),
+            payload.meter_id,
+            payload.start_source_record_id,
+            payload.end_source_record_id,
+        )
+
+    @app.post(
+        "/api/v1/corrections/confirm",
+        response_model=CorrectionConfirmResponse,
+        responses={
+            404: {"model": CorrectionErrorResponse, "description": "端点记录不存在"},
+            409: {
+                "model": CorrectionErrorResponse,
+                "description": "快照过期 / 方案已变化或不唯一 / 无解",
+            },
+            422: {"model": CorrectionErrorResponse, "description": "请求参数非法"},
+            503: {"model": ErrorResponse},
+        },
+        tags=["纠错"],
+    )
+    def confirm_correction(
+        payload: CorrectionConfirmRequest, request: Request
+    ) -> CorrectionConfirmResponse:
+        """确认纠错提案：一个写事务内核对序号与方案，再撤销并重建区间。
+
+        * 在同一个 `BEGIN IMMEDIATE` 事务内核对当前提交序号等于
+          `expected_commit_seq`，并重新求解确认方案仍唯一且撤销集合一致。
+        * 序号过期、方案变化、不再唯一或无解时整体回滚，读数与区间都不变。
+        * 撤销集合为空（提案本身无需撤销）时不推进提交序号。
+        """
+        return correction_confirm(
+            settings_of(request),
+            payload.meter_id,
+            payload.start_source_record_id,
+            payload.end_source_record_id,
+            payload.expected_commit_seq,
+            payload.revoke_source_record_ids,
+        )
 
     @app.get(
         "/api/v1/meters",

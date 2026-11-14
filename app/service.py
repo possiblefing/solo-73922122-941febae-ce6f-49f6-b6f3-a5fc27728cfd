@@ -27,6 +27,7 @@ from datetime import datetime
 from typing import Iterable, Sequence
 
 from .config import Settings
+from .correction import PlanningPoint, WindowPlan, plan_window
 from .db import (
     bump_commit_seq,
     connection,
@@ -36,6 +37,10 @@ from .db import (
 )
 from .models import (
     ConflictDetail,
+    CorrectionConfirmResponse,
+    CorrectionErrorResponse,
+    CorrectionProposalResponse,
+    CorrectionSegmentInfo,
     IntervalOut,
     MeterStateResponse,
     MeterSummary,
@@ -63,6 +68,32 @@ class BatchRejected(Exception):
         super().__init__(message)
         self.message = message
         self.conflicts = list(conflicts)
+
+
+class CorrectionRejected(Exception):
+    """A correction proposal/confirm cannot be actioned.
+
+    Carries an API error code plus the HTTP status the route should emit.
+    Nothing is ever written when this is raised.
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int,
+        details: dict[str, str] | None = None,
+    ):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        self.details = details
+
+    def as_response(self) -> CorrectionErrorResponse:
+        return CorrectionErrorResponse(
+            code=self.code, message=self.message, details=self.details
+        )
 
 
 def _content_hash(reading: ReadingIn) -> str:
@@ -598,4 +629,277 @@ def query_meter(
                 intervals=interval_outs,
                 breaks=breaks,
                 usage_total=int(usage_total),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Correction proposals and confirmations
+# ---------------------------------------------------------------------------
+
+
+def _load_correction_window(
+    conn: sqlite3.Connection,
+    meter_id: str,
+    start_source_id: str,
+    end_source_id: str,
+) -> list[sqlite3.Row]:
+    """Load the closed time-ordered reading window between two trusted ids."""
+    rows = conn.execute(
+        "SELECT id, source_record_id, meter_id, read_at_us, reading, "
+        "meter_replaced FROM readings WHERE source_record_id IN (?, ?)",
+        (start_source_id, end_source_id),
+    ).fetchall()
+    by_id = {row["source_record_id"]: row for row in rows}
+    missing = [
+        source_id
+        for source_id in (start_source_id, end_source_id)
+        if source_id not in by_id
+    ]
+    if missing:
+        raise CorrectionRejected(
+            code="correction_endpoint_not_found",
+            status_code=404,
+            message=f"可信源记录号不存在: {', '.join(missing)}",
+            details={source_id: "not_found" for source_id in missing},
+        )
+    start_row, end_row = by_id[start_source_id], by_id[end_source_id]
+    wrong_meter = sorted(
+        {
+            row["source_record_id"]
+            for row in (start_row, end_row)
+            if row["meter_id"] != meter_id
+        }
+    )
+    if wrong_meter:
+        raise CorrectionRejected(
+            code="correction_invalid_range",
+            status_code=422,
+            message=(
+                f"端点记录不属于电表 {meter_id}: {', '.join(wrong_meter)}"
+            ),
+            details={source_id: "meter_mismatch" for source_id in wrong_meter},
+        )
+    if start_row["read_at_us"] >= end_row["read_at_us"]:
+        raise CorrectionRejected(
+            code="correction_invalid_range",
+            status_code=422,
+            message=(
+                "起点源记录号必须在时序上严格早于终点源记录号"
+                if start_row["read_at_us"] > end_row["read_at_us"]
+                else "两个端点指向同一时刻；同一电表同一时刻只允许一条读数"
+            ),
+            details={
+                "start_source_record_id": start_source_id,
+                "end_source_record_id": end_source_id,
+            },
+        )
+
+    return conn.execute(
+        "SELECT id, source_record_id, meter_id, read_at_us, reading, "
+        "meter_replaced FROM readings WHERE meter_id = ? "
+        "AND read_at_us >= ? AND read_at_us <= ? ORDER BY read_at_us ASC",
+        (meter_id, start_row["read_at_us"], end_row["read_at_us"]),
+    ).fetchall()
+
+
+def _plan_from_rows(
+    rows: Sequence[sqlite3.Row],
+) -> WindowPlan[str]:
+    points: list[PlanningPoint[str]] = []
+    for index, row in enumerate(rows):
+        is_endpoint = index == 0 or index == len(rows) - 1
+        points.append(
+            PlanningPoint(
+                ref=row["source_record_id"],
+                value=int(row["reading"]),
+                mandatory=is_endpoint or bool(row["meter_replaced"]),
+                replaced=bool(row["meter_replaced"]),
+            )
+        )
+    return plan_window(points)
+
+
+def _segment_infos(plan: WindowPlan[str]) -> list[CorrectionSegmentInfo]:
+    infos: list[CorrectionSegmentInfo] = []
+    for segment in plan.segments:
+        infos.append(
+            CorrectionSegmentInfo(
+                segment_index=segment.segment_index,
+                start_source_record_id=segment.points[0].ref,
+                end_source_record_id=segment.points[-1].ref,
+                reading_count=len(segment.points),
+                mandatory_count=segment.mandatory_count,
+                revoke_source_record_ids=list(segment.revoke_refs),
+                alternative_revoke_source_record_ids=(
+                    list(segment.alternative_revoke_refs)
+                    if segment.alternative_revoke_refs is not None
+                    else None
+                ),
+                reason=segment.reason,
+            )
+        )
+    return infos
+
+
+def correction_propose(
+    settings: Settings,
+    meter_id: str,
+    start_source_id: str,
+    end_source_id: str,
+) -> CorrectionProposalResponse:
+    """Compute the minimum-revocation plan on one read snapshot."""
+    with connection(settings) as conn:
+        with read_transaction(conn):
+            commit_seq = current_commit_seq(conn)
+            rows = _load_correction_window(
+                conn, meter_id, start_source_id, end_source_id
+            )
+            plan = _plan_from_rows(rows)
+
+            if not plan.feasible:
+                return CorrectionProposalResponse(
+                    status="no_solution",
+                    reason=plan.reason,
+                    meter_id=meter_id,
+                    start_source_record_id=start_source_id,
+                    end_source_record_id=end_source_id,
+                    commit_seq=commit_seq,
+                    minimum_revoke_count=None,
+                    revoke_source_record_ids=[],
+                    segments=_segment_infos(plan),
+                )
+            if not plan.unique:
+                return CorrectionProposalResponse(
+                    status="not_unique",
+                    reason=plan.reason,
+                    meter_id=meter_id,
+                    start_source_record_id=start_source_id,
+                    end_source_record_id=end_source_id,
+                    commit_seq=commit_seq,
+                    minimum_revoke_count=None,
+                    revoke_source_record_ids=[],
+                    segments=_segment_infos(plan),
+                )
+            return CorrectionProposalResponse(
+                status="unique",
+                reason=None,
+                meter_id=meter_id,
+                start_source_record_id=start_source_id,
+                end_source_record_id=end_source_id,
+                commit_seq=commit_seq,
+                minimum_revoke_count=len(plan.revoke_refs),
+                revoke_source_record_ids=list(plan.revoke_refs),
+                segments=_segment_infos(plan),
+            )
+
+
+def correction_confirm(
+    settings: Settings,
+    meter_id: str,
+    start_source_id: str,
+    end_source_id: str,
+    expected_commit_seq: int,
+    requested_revoke_ids: Sequence[str],
+) -> CorrectionConfirmResponse:
+    """Re-validate a proposal inside one write transaction and apply it.
+
+    The commit sequence and the unique minimum revoke set are both checked
+    against the *current* committed state.  On any mismatch the transaction
+    rolls back and neither readings nor intervals change.
+    """
+    requested_set = set(requested_revoke_ids)
+    with connection(settings) as conn:
+        with write_transaction(conn):
+            current_seq = current_commit_seq(conn)
+            if current_seq != expected_commit_seq:
+                raise CorrectionRejected(
+                    code="correction_stale",
+                    status_code=409,
+                    message=(
+                        f"提案快照序号 {expected_commit_seq} 已过期，"
+                        f"当前提交序号为 {current_seq}；请重新提案"
+                    ),
+                    details={
+                        "expected_commit_seq": str(expected_commit_seq),
+                        "current_commit_seq": str(current_seq),
+                    },
+                )
+
+            rows = _load_correction_window(
+                conn, meter_id, start_source_id, end_source_id
+            )
+            plan = _plan_from_rows(rows)
+            if not plan.feasible:
+                raise CorrectionRejected(
+                    code="correction_no_solution",
+                    status_code=409,
+                    message=plan.reason or "当前状态下不存在可行纠错方案",
+                )
+            if not plan.unique:
+                raise CorrectionRejected(
+                    code="correction_not_unique",
+                    status_code=409,
+                    message=plan.reason or "最少撤销方案不唯一，拒绝自动确认",
+                )
+
+            current_plan_set = set(plan.revoke_refs)
+            if requested_set != current_plan_set:
+                raise CorrectionRejected(
+                    code="correction_plan_mismatch",
+                    status_code=409,
+                    message=(
+                        "提交的撤销集合与当前唯一最少方案不一致；请重新提案"
+                    ),
+                    details={
+                        "submitted": ",".join(sorted(requested_set)),
+                        "current_plan": ",".join(sorted(current_plan_set)),
+                    },
+                )
+
+            records = [
+                RecordResult(source_record_id=source_id, status="removed")
+                for source_id in plan.revoke_refs
+            ]
+            if not current_plan_set:
+                # Nothing to revoke: no mutation, the commit sequence must not
+                # advance.
+                return CorrectionConfirmResponse(
+                    meter_id=meter_id,
+                    start_source_record_id=start_source_id,
+                    end_source_record_id=end_source_id,
+                    commit_seq=current_seq,
+                    changed=False,
+                    counts={},
+                    records=[],
+                    affected_meters=[_meter_summary(conn, meter_id)],
+                )
+
+            id_rows = conn.execute(
+                "SELECT id FROM readings WHERE source_record_id IN (%s)"
+                % ",".join("?" for _ in current_plan_set),
+                list(current_plan_set),
+            ).fetchall()
+            reading_ids = [row["id"] for row in id_rows]
+
+            new_commit_seq = bump_commit_seq(conn)
+            conn.executemany(
+                "DELETE FROM intervals WHERE from_reading_id = ? "
+                "OR to_reading_id = ?",
+                [(rid, rid) for rid in reading_ids],
+            )
+            conn.executemany(
+                "DELETE FROM readings WHERE id = ?",
+                [(rid,) for rid in reading_ids],
+            )
+            _recompute_intervals(conn, meter_id, new_commit_seq)
+
+            return CorrectionConfirmResponse(
+                meter_id=meter_id,
+                start_source_record_id=start_source_id,
+                end_source_record_id=end_source_id,
+                commit_seq=new_commit_seq,
+                changed=True,
+                counts={"removed": len(reading_ids)},
+                records=records,
+                affected_meters=[_meter_summary(conn, meter_id)],
             )

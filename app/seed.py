@@ -24,6 +24,14 @@ _READINGS = [
     ("M-1002", "demo-m1002-0100", "2026-10-01T01:00:00Z", 640, False),
     ("M-1002", "demo-m1002-0200", "2026-10-01T02:00:00Z", 610, False),
     ("M-1002", "demo-m1002-0300", "2026-10-01T03:00:00Z", 700, False),
+    # M-1003 carries a single gateway misread: the 02:00 cumulative value
+    # (815) dips below the 01:00 reading — a counter rollback that correction
+    # proposals are expected to isolate and revoke.
+    ("M-1003", "demo-m1003-0000", "2026-10-01T00:00:00Z", 800, False),
+    ("M-1003", "demo-m1003-0100", "2026-10-01T01:00:00Z", 860, False),
+    ("M-1003", "demo-m1003-0200", "2026-10-01T02:00:00Z", 815, False),
+    ("M-1003", "demo-m1003-0300", "2026-10-01T03:00:00Z", 930, False),
+    ("M-1003", "demo-m1003-0400", "2026-10-01T04:00:00Z", 1005, False),
 ]
 
 

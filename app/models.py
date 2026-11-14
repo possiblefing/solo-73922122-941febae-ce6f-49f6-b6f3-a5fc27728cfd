@@ -102,6 +102,121 @@ class UndoRequest(BaseModel):
         return cleaned
 
 
+class CorrectionProposeRequest(BaseModel):
+    """纠错提案：同一电表时序上两个可信源记录号划定的闭区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    meter_id: str = Field(..., min_length=1, max_length=128, description="电表号")
+    start_source_record_id: str = Field(
+        ..., min_length=1, max_length=255, description="时序在先的可信源记录号（含）"
+    )
+    end_source_record_id: str = Field(
+        ..., min_length=1, max_length=255, description="时序在后的可信源记录号（含）"
+    )
+
+    @field_validator("meter_id", "start_source_record_id", "end_source_record_id")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+
+class CorrectionConfirmRequest(CorrectionProposeRequest):
+    """工程师确认：携带提案快照序号与提案给出的待撤销集合。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_commit_seq: int = Field(
+        ..., ge=0, description="提案返回的已提交快照提交序号"
+    )
+    revoke_source_record_ids: list[str] = Field(
+        ...,
+        min_length=0,
+        max_length=1000,
+        description="提案给出的待撤销源记录号（允许为空集，表示无需撤销）",
+    )
+
+    @field_validator("revoke_source_record_ids")
+    @classmethod
+    def _revoke_not_blank(cls, values: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                raise ValueError(
+                    "revoke_source_record_ids must not contain blank values"
+                )
+            cleaned.append(value)
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("revoke_source_record_ids must not contain duplicates")
+        return cleaned
+
+
+class CorrectionSegmentInfo(BaseModel):
+    segment_index: int = Field(..., description="换表边界切出的段序号，从 0 开始")
+    start_source_record_id: str
+    end_source_record_id: str
+    reading_count: int = Field(..., description="段内读数条数（含两端/换表点）")
+    mandatory_count: int = Field(..., description="必须保留的读数条数")
+    revoke_source_record_ids: list[str] = Field(
+        default_factory=list, description="该段最少撤销方案的源记录号；无解时为空"
+    )
+    alternative_revoke_source_record_ids: list[str] | None = Field(
+        default=None, description="方案不唯一时，另一个同等长度的最少撤销集合"
+    )
+    reason: str | None = Field(
+        default=None, description="该段无解/不唯一的具体原因"
+    )
+
+
+class CorrectionProposalResponse(BaseModel):
+    status: Literal["unique", "no_solution", "not_unique"]
+    reason: str | None = Field(
+        default=None, description="status 非 unique 时的原因说明"
+    )
+    meter_id: str
+    start_source_record_id: str
+    end_source_record_id: str
+    commit_seq: int = Field(..., description="提案所依据的已提交快照提交序号")
+    minimum_revoke_count: int | None = Field(
+        default=None, description="最少需撤销读数条数；无解时为 null"
+    )
+    revoke_source_record_ids: list[str] = Field(
+        default_factory=list,
+        description="唯一最少方案的待撤销源记录号（时序顺序）；非 unique 时为空",
+    )
+    segments: list[CorrectionSegmentInfo] = Field(
+        default_factory=list, description="各换表段的求解明细"
+    )
+
+
+class CorrectionConfirmResponse(BaseModel):
+    meter_id: str
+    start_source_record_id: str
+    end_source_record_id: str
+    commit_seq: int = Field(..., description="确认生效后的最新提交序号")
+    changed: bool
+    counts: dict[str, int]
+    records: list[RecordResult]
+    affected_meters: list[MeterSummary]
+
+
+class CorrectionErrorResponse(BaseModel):
+    code: Literal[
+        "correction_no_solution",
+        "correction_not_unique",
+        "correction_stale",
+        "correction_plan_mismatch",
+        "correction_invalid_range",
+        "correction_endpoint_not_found",
+    ]
+    message: str
+    details: dict[str, str] | None = None
+
+
 class RecordResult(BaseModel):
     source_record_id: str
     status: Literal["created", "unchanged", "removed", "not_found"]

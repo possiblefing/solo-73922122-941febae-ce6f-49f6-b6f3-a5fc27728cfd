@@ -19,7 +19,6 @@ from tests.common import (
     assert_db_invariants,
     assert_meter_consistent,
     assert_usage_matches_readings,
-    at,
     reading,
 )
 
@@ -337,3 +336,69 @@ def test_restart_reuses_database_and_schema(db_path, settings):
             assert_meter_consistent(body)
     finally:
         restarted.stop()
+
+
+def test_correction_confirm_is_serialised_across_processes(two_servers, settings):
+    """Only one of two concurrent confirms on the same proposal can win."""
+    with _client(two_servers[0]) as client:
+        client.post(
+            "/api/v1/readings",
+            json={
+                "readings": [
+                    reading("M1", "a", 0, 100),
+                    reading("M1", "b", 60, 90),
+                    reading("M1", "c", 120, 200),
+                ]
+            },
+        )
+        proposal = client.post(
+            "/api/v1/corrections/propose",
+            json={
+                "meter_id": "M1",
+                "start_source_record_id": "a",
+                "end_source_record_id": "c",
+            },
+        ).json()
+        assert proposal["status"] == "unique"
+        seq = proposal["commit_seq"]
+        payload = {
+            "meter_id": "M1",
+            "start_source_record_id": "a",
+            "end_source_record_id": "c",
+            "expected_commit_seq": seq,
+            "revoke_source_record_ids": ["b"],
+        }
+
+    def confirm(server):
+        with _client(server) as client:
+            return client.post("/api/v1/corrections/confirm", json=payload)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(confirm, [two_servers[0], two_servers[1]])
+        )
+
+    # Exactly one confirmation may commit.  The loser is rejected as stale
+    # (409) once the winner advances the sequence, or as busy (503) if it
+    # loses the SQLite write-lock race; neither outcome corrupts the database.
+    assert sum(response.status_code == 200 for response in results) == 1
+    assert all(
+        response.status_code in (200, 409, 503) for response in results
+    )
+
+    with _client(two_servers[0]) as client:
+        body = client.get("/api/v1/meters/M1").json()
+    assert [r["source_record_id"] for r in body["readings"]] == ["a", "c"]
+    assert_meter_consistent(body)
+    with connection(settings) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert_db_invariants(conn, "M1")
+
+    # A second confirmation on the same (now consumed) proposal is stale.
+    with _client(two_servers[1]) as client:
+        replay = client.post("/api/v1/corrections/confirm", json=payload)
+    assert replay.status_code == 409
+    assert replay.json()["code"] == "correction_stale"
+    with _client(two_servers[0]) as client:
+        body = client.get("/api/v1/meters/M1").json()
+    assert [r["source_record_id"] for r in body["readings"]] == ["a", "c"]

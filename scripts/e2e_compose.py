@@ -99,6 +99,78 @@ def main(base_url: str, second_url: str | None = None) -> int:
         assert other_state["intervals"] == state["intervals"]
         print("second process sees the same snapshot:", other_state["commit_seq"])
 
+    # --- correction proposal + confirmation on a meter with a rollback.
+    correction_batch = {
+        "readings": [
+            {"meter_id": "E2E-CORR", "source_record_id": "corr-00",
+             "read_at": "2026-03-01T00:00:00Z", "reading": 100},
+            {"meter_id": "E2E-CORR", "source_record_id": "corr-01",
+             "read_at": "2026-03-01T01:00:00Z", "reading": 90},
+            {"meter_id": "E2E-CORR", "source_record_id": "corr-02",
+             "read_at": "2026-03-01T02:00:00Z", "reading": 150},
+            {"meter_id": "E2E-CORR", "source_record_id": "corr-03",
+             "read_at": "2026-03-01T03:00:00Z", "reading": 200},
+        ]
+    }
+    with httpx.Client(base_url=base_url, timeout=30.0) as client:
+        assert client.post(
+            "/api/v1/readings", json=correction_batch
+        ).status_code == 200
+        proposal = client.post(
+            "/api/v1/corrections/propose",
+            json={
+                "meter_id": "E2E-CORR",
+                "start_source_record_id": "corr-00",
+                "end_source_record_id": "corr-03",
+            },
+        )
+        assert proposal.status_code == 200, proposal.text
+        proposal_body = proposal.json()
+        assert proposal_body["status"] == "unique"
+        assert proposal_body["revoke_source_record_ids"] == ["corr-01"]
+        snapshot_seq = proposal_body["commit_seq"]
+        print(
+            "correction proposal:",
+            proposal_body["status"],
+            proposal_body["revoke_source_record_ids"],
+        )
+
+        confirm = client.post(
+            "/api/v1/corrections/confirm",
+            json={
+                "meter_id": "E2E-CORR",
+                "start_source_record_id": "corr-00",
+                "end_source_record_id": "corr-03",
+                "expected_commit_seq": snapshot_seq,
+                "revoke_source_record_ids": ["corr-01"],
+            },
+        )
+        assert confirm.status_code == 200, confirm.text
+        assert confirm.json()["changed"] is True
+        corrected = client.get("/api/v1/meters/E2E-CORR").json()
+        assert [r["source_record_id"] for r in corrected["readings"]] == [
+            "corr-00",
+            "corr-02",
+            "corr-03",
+        ]
+        assert corrected["breaks"] == []
+        print("correction confirmed at commit", confirm.json()["commit_seq"])
+
+        # Re-confirming the consumed proposal must fail as stale, with no
+        # further change.
+        stale = client.post(
+            "/api/v1/corrections/confirm",
+            json={
+                "meter_id": "E2E-CORR",
+                "start_source_record_id": "corr-00",
+                "end_source_record_id": "corr-03",
+                "expected_commit_seq": snapshot_seq,
+                "revoke_source_record_ids": ["corr-01"],
+            },
+        )
+        assert stale.status_code == 409
+        assert stale.json()["code"] == "correction_stale"
+
     # /docs must be usable.
     with httpx.Client(base_url=base_url, timeout=10.0) as client:
         docs = client.get("/docs")
@@ -107,6 +179,8 @@ def main(base_url: str, second_url: str | None = None) -> int:
         paths = spec["paths"]
         assert "/api/v1/readings" in paths
         assert "/api/v1/readings/undo" in paths
+        assert "/api/v1/corrections/propose" in paths
+        assert "/api/v1/corrections/confirm" in paths
         assert "/api/v1/meters/{meter_id}" in paths
     print("openapi paths ok")
     return 0
