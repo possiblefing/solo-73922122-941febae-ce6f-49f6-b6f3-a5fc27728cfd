@@ -1,0 +1,54 @@
+# Two API containers share one SQLite database volume.
+#
+#   docker compose up -d --build
+#   open http://localhost:8000/docs    (api-1)
+#   open http://localhost:8002/docs    (api-2 — same data, second OS process)
+#
+# Both processes serve the same database file, so requests can be sent to
+# either port interchangeably; send concurrent writes to both to exercise the
+# cross-process guarantees.
+#
+# The database lives on the named volume `energy-data`:
+#   docker compose down      -> keeps data
+#   docker compose down -v   -> wipes data
+
+x-api: &api
+  build:
+    context: .
+  image: energy-api:latest
+  restart: unless-stopped
+  environment: &api-env
+    ENERGY_DB_PATH: /data/energy.sqlite3
+    ENERGY_BUSY_TIMEOUT_MS: "30000"
+  volumes:
+    - energy-data:/data
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
+
+services:
+  api-1:
+    <<: *api
+    container_name: energy-api-1
+    environment:
+      <<: *api-env
+    ports:
+      - "8000:8000"
+
+  api-2:
+    <<: *api
+    container_name: energy-api-2
+    environment:
+      <<: *api-env
+    ports:
+      - "8002:8000"
+
+volumes:
+  energy-data:
